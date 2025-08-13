@@ -1,14 +1,25 @@
 import glob
 from pathlib import Path
+from typing import List, Set, Tuple
 
 from .graph import DagGraph
 from .helper import SqlHelper
 
 
 def read_from_file(file_path: str) -> str:
+    """
+    从文件或目录中读取SQL语句
+
+    Args:
+        file_path: 文件路径，支持通配符
+
+    Returns:
+        读取的SQL字符串
+    """
     sql_file_path = Path(file_path)
     sql_stmt_str = ""
     file_lst = []
+
     if sql_file_path.is_file():
         with open(sql_file_path, "r") as f:
             return f.read()
@@ -21,48 +32,63 @@ def read_from_file(file_path: str) -> str:
         file_lst = glob.glob(file_path)
 
     for sql_file in file_lst:
-        sql_str = open(sql_file, "r").read()
-        if not sql_str.strip().endswith(";\n"):
-            sql_str = sql_str + "\n;\n"
+        with open(sql_file, "r") as f:
+            sql_str = f.read()
+        if not sql_str.strip().endswith(";"):
+            sql_str = sql_str + ";\n"
         sql_stmt_str += sql_str
     return sql_stmt_str
 
 
-# def read_sql_str_to_sql_stmt_lst(sql_stmt_str: str) -> list:
-#     return SqlHelper.split(sql_stmt_str)
+def get_all_source_tables(sql_stmt_str: str) -> List[str]:
+    """
+    获取所有SQL语句中涉及的源表，包含了中间表
 
+    Args:
+        sql_stmt_str: SQL语句字符串
 
-def get_source_tables(sql_stmt_str: str) -> list:
+    Returns:
+        源表列表
+    """
     sql_stmt_lst = SqlHelper.split(sql_stmt_str)
-    rs = []
+    source_tables = set()
+
     for sql_stmt in sql_stmt_lst:
-        x = SqlHelper().get_source_target_tables(sql_stmt)
-        if x:
-            source_tables = x["source_table"]
-            for source_table in source_tables:
-                rs.append(source_table)
-    return list(set(rs))
+        table_info = SqlHelper().get_source_target_tables(sql_stmt)
+        if table_info:
+            source_tables.update(table_info["source_table"])
+
+    return list(source_tables)
 
 
-def print_dag(sql_stmt_str: str) -> None:
+def print_mermaid_dag(sql_stmt_str: str) -> None:
+    """
+    打印SQL语句的DAG图（mermaid格式）
+
+    Args:
+        sql_stmt_str: SQL语句字符串
+    """
     sql_stmt_lst = SqlHelper.split(sql_stmt_str)
-    dg = __sql_to_dag(sql_stmt_lst)
+    dg = _sql_to_dag(sql_stmt_lst)
     dg.print_all_edges_to_mermaid()
 
 
-def get_mermaid_str(sql_stmt_str: str) -> str:
-    sql_stmt_lst = SqlHelper.split(sql_stmt_str)
-    dg = __sql_to_dag(sql_stmt_lst)
-    return dg.get_all_edges_to_mermaid()
+def _sql_to_dag(sql_stmt_lst: List[str]) -> DagGraph:
+    """
+    将SQL语句列表转换为DAG图
 
+    Args:
+        sql_stmt_lst: SQL语句列表
 
-def __sql_to_dag(sql_stmt_lst: list) -> DagGraph:
+    Returns:
+        DAG图对象
+    """
     dg = DagGraph()
     for sql_stmt in sql_stmt_lst:
-        x = SqlHelper().get_source_target_tables(sql_stmt)
-        if x:
-            target_tables = x["target_table"]
-            source_tables = x["source_table"]
+        table_info = SqlHelper().get_source_target_tables(sql_stmt)
+        if table_info:
+            target_tables = table_info["target_table"]
+            source_tables = table_info["source_table"]
             for source_table in source_tables:
                 if target_tables:
                     for target_table in target_tables:
@@ -70,65 +96,131 @@ def __sql_to_dag(sql_stmt_lst: list) -> DagGraph:
     return dg
 
 
-def get_first_level_source_tables(sql_stmt_str: str):
-    """获取没有上游写入的底表，比如ods表，没有写入任务的表"""
+def _collect_tables(sql_stmt_str: str) -> Tuple[Set[str], Set[str]]:
+    """
+    收集SQL语句中的源表和目标表
+
+    Args:
+        sql_stmt_str: SQL语句字符串
+
+    Returns:
+        (源表集合, 目标表集合)
+    """
     sql_stmt_lst = SqlHelper.split(sql_stmt_str)
-    source_tables2 = []
-    target_tables2 = []
+    source_tables = set()
+    target_tables = set()
+
     for sql_stmt in sql_stmt_lst:
-        x = SqlHelper().get_source_target_tables(sql_stmt)
-        if x:
-            source_tables = x["source_table"]
-            target_tables = x["target_table"]
-            for source_table in source_tables:
-                source_tables2.append(source_table.replace("`", ""))
-            for target_table in target_tables:
-                target_tables2.append(target_table.replace("`", ""))
-    return [source_table for source_table in set(source_tables2) if source_table not in target_tables2]
+        table_info = SqlHelper().get_source_target_tables(sql_stmt)
+        if table_info:
+            # 处理源表
+            for source_table in table_info["source_table"]:
+                source_tables.add(source_table.replace("`", ""))
+            # 处理目标表
+            for target_table in table_info["target_table"]:
+                target_tables.add(target_table.replace("`", ""))
+
+    return source_tables, target_tables
 
 
-def get_last_level_target_tables(sql_stmt_str: str):
-    """获取没有下游任务的目标表，比如ads表，最下游的表"""
+def get_root_tables(sql_stmt_str: str) -> List[str]:
+    """
+    获取没有上游写入的底表，比如ods表，没有写入任务的表
+
+    Args:
+        sql_stmt_str: SQL语句字符串
+
+    Returns:
+        根表列表
+    """
+    source_tables, target_tables = _collect_tables(sql_stmt_str)
+    return list(source_tables - target_tables)
+
+
+def get_leaf_tables(sql_stmt_str: str) -> List[str]:
+    """
+    获取没有下游任务的目标表，比如ads表，最下游的表
+
+    Args:
+        sql_stmt_str: SQL语句字符串
+
+    Returns:
+        叶子表列表
+    """
+    source_tables, target_tables = _collect_tables(sql_stmt_str)
+    return list(target_tables - source_tables)
+
+
+def print_related_edges_upstream(sql_stmt_str: str, target_table: str) -> None:
+    """
+    向前查找与目标表相关的表，并打印出所有相关表的DAG
+
+    Args:
+        sql_stmt_str: SQL语句字符串
+        target_table: 目标表名
+    """
     sql_stmt_lst = SqlHelper.split(sql_stmt_str)
-    source_tables2 = []
-    target_tables2 = []
-    for sql_stmt in sql_stmt_lst:
-        x = SqlHelper().get_source_target_tables(sql_stmt)
-        if x:
-            source_tables = x["source_table"]
-            target_tables = x["target_table"]
-            for source_table in source_tables:
-                source_tables2.append(source_table.replace("`", ""))
-            for target_table in target_tables:
-                target_tables2.append(target_table.replace("`", ""))
-    return [target_tables for target_tables in set(target_tables2) if target_tables not in source_tables2]
+    dg = _sql_to_dag(sql_stmt_lst)
+    related_edges = dg.find_related_edges_upstream(target_table)
+    dg.print_edges_to_mermaid(related_edges)
 
 
-def __get_related_edges_forward(sql_stmt_str: str, target_table: str):
-    """向前查找与目标表相关的表，返回edge列表"""
+def get_related_first_source_tables_upstream(sql_stmt_str: str, target_table: str) -> List[str]:
+    """
+    查询与目标表相关的表，返回第一层原始来源表
+
+    Args:
+        sql_stmt_str: SQL语句字符串
+        target_table: 目标表名
+
+    Returns:
+        第一层原始来源表列表
+    """
+    # related_edges = _get_related_edges_forward(sql_stmt_str, target_table)
     sql_stmt_lst = SqlHelper.split(sql_stmt_str)
-    dg = __sql_to_dag(sql_stmt_lst)
-    related_edges = dg.find_related_edges_forward(target_table)
-    return related_edges
+    dg = _sql_to_dag(sql_stmt_lst)
+    related_edges = dg.find_related_edges_upstream(target_table)
+    if not related_edges:
+        return []
+
+    source_tables = set(edge[0] for edge in related_edges)
+    target_tables = set(edge[1] for edge in related_edges)
+    return list(source_tables - target_tables)
 
 
-def print_related_edges_forward(sql_stmt_str: str, target_table: str):
-    """向前查找与目标表相关的表，并打印出所有相关表的DAG"""
-    related_edges = __get_related_edges_forward(sql_stmt_str, target_table)
-    DagGraph().print_dag_from_edges(related_edges)
+def print_related_edges_downstream(sql_stmt_str: str, target_table: str) -> None:
+    """
+    向前查找与目标表相关的表，并打印出所有相关表的DAG
+
+    Args:
+        sql_stmt_str: SQL语句字符串
+        target_table: 目标表名
+    """
+    sql_stmt_lst = SqlHelper.split(sql_stmt_str)
+    dg = _sql_to_dag(sql_stmt_lst)
+    related_edges = dg.find_related_edges_downstream(target_table)
+    dg.print_edges_to_mermaid(related_edges)
 
 
-def get_related_first_source_tables_forward(sql_stmt_str: str, target_table: str):
-    """查询与目标表相关的表，返回第一层原始来源表"""
-    related_edges = __get_related_edges_forward(sql_stmt_str, target_table)
-    source_tables = list(set([edge[0] for edge in related_edges]))
-    target_tables = list(set([edge[1] for edge in related_edges]))
-    return list(set([source_table for source_table in source_tables if source_table not in target_tables]))
+def visualize_dag(sql_stmt_str: str, filename: str = "dag_mermaid.html", title: str = "DAG Visualization") -> None:
+    """
+    可视化DAG图
 
+    Args:
+        sql_stmt_str: SQL语句字符串
+    """
+    import os
+    import webbrowser
 
-def get_all_related_tables_forward(sql_stmt_str: str, target_table: str):
-    """查询与目标表相关的表，返回所有相关表"""
-    related_edges = __get_related_edges_forward(sql_stmt_str, target_table)
-    source_tables = [edge[0] for edge in related_edges]
-    target_tables = [edge[1] for edge in related_edges]
-    return list(set(source_tables) | set(target_tables))
+    sql_stmt_lst = SqlHelper.split(sql_stmt_str)
+    dg = _sql_to_dag(sql_stmt_lst)
+
+    html_content = dg.get_mermaidjs_dag(title)
+
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    # 获取绝对路径并打开
+    abs_path = os.path.abspath(filename)
+    webbrowser.open(f"file://{abs_path}")
+    print(f"Mermaid.js HTML文件已生成并打开: {abs_path}")

@@ -232,6 +232,7 @@ class SqlHelper:
                 if token.upper() == "WITH":
                     was_pre_with = True
                     is_cte = True
+                    continue
 
                 if token.upper() in KeyWords.keywords:
                     if was_pre_right_bracket and is_cte and bracket_level == 0 and token.upper() != "AS":
