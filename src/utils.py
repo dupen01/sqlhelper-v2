@@ -61,6 +61,34 @@ def get_all_source_tables(sql_stmt_str: str) -> List[str]:
     return list(source_tables)
 
 
+def pretty_print_lineage(sql_stmt_str: str) -> None:
+    sql_stmt_lst = SqlHelper.split(sql_stmt_str)
+    result = {}
+    for sql_stmt in sql_stmt_lst:
+        table_info = SqlHelper().get_source_target_tables(sql_stmt)
+        # print(table_info)
+        if table_info:
+            source_tables = table_info.get("source_table", [])
+            target_tables = table_info.get("target_table", [])
+
+            # 为每个目标表添加源表列表
+            for target_table in target_tables:
+                target_table_clean = target_table.replace("`", "")
+                if target_table_clean not in result:
+                    result[target_table_clean] = []
+                # 添加源表（去重但保持顺序）
+                for source_table in source_tables:
+                    source_table_clean = source_table.replace("`", "")
+                    if source_table_clean not in result[target_table_clean]:
+                        result[target_table_clean].append(source_table_clean)
+
+    for target_table_clean, source_tables in result.items():
+        print(target_table_clean)
+        for source_table in source_tables:
+            print(f"  ├─ {source_table}")
+    return
+
+
 def print_mermaid_dag(sql_stmt_str: str) -> None:
     """
     打印SQL语句的DAG图（mermaid格式）

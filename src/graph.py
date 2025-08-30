@@ -200,7 +200,7 @@ class DagGraph:
 
         return False
 
-    def _get_mermaid_str(self, edges: set) -> str:
+    def _get_mermaid_str(self, edges: set, direction="LR") -> str:
         """
         获取 Mermaid 格式字符串
 
@@ -208,7 +208,7 @@ class DagGraph:
             Mermaid格式的图描述字符串
         """
         # edges = list(self.__edges)
-        mermaid_str = "graph LR\n"
+        mermaid_str = f"graph {direction}\n"
         if not edges:
             return mermaid_str
 
@@ -217,10 +217,16 @@ class DagGraph:
         return mermaid_str
 
     def print_all_edges_to_mermaid(self) -> None:
+        """
+        输出所有边到Mermaid格式的图描述字符串
+        """
         mermaid_str = self._get_mermaid_str(self.__edges)
         print(mermaid_str)
 
     def print_edges_to_mermaid(self, edges: set) -> None:
+        """
+        输出指定边到Mermaid格式的图描述字符串
+        """
         mermaid_str = self._get_mermaid_str(edges)
         print(mermaid_str)
 
@@ -309,7 +315,7 @@ class DagGraph:
         import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
         mermaid.initialize({{ startOnLoad: true }});
         </script>
-        
+
     </head>
     <body>
         <div class="mermaid">
