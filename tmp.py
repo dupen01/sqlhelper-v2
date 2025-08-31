@@ -53,7 +53,7 @@ class ColumnLineageExtractor:
     def _traverse_ast(self, node: exp.Expression):
         """递归遍历 AST 并提取血缘关系"""
 
-        if isinstance(node, exp.Insert):
+        if isinstance(node, (exp.Insert, exp.Create)):
             # todo 去掉 table 的引号
             if isinstance(node.this, exp.Table):
                 self.target_table = node.this.name
@@ -226,9 +226,21 @@ class ColumnLineageExtractor:
 
 
 sql = """
-SELECT id, name, 'employee' AS type FROM employees
-    UNION ALL
-    SELECT id, name, 'customer' AS type FROM customers
+create table if not exists tmp_hive.dwd_p7_new_tmp_1 
+(
+extracted_code,
+extracted_date,
+shop_code,
+shop_name
+)
+as 
+ SELECT a.extracted_code  -- `提取单号`
+    ,a.extracted_date  -- `提取日期`
+    ,a.member_id
+    ,IFNULL(IFNULL(c.deal_shop_code,a.financial_shop_code),a.extracted_shop_code) shop_code -- as '归属门店编码'
+    ,IFNULL(IFNULL(c.deal_shop_name,a.financial_shop_name),a.extracted_shop_name) shop_name -- as '归属门店名称'
+ FROM ttt a
+
 """
 
 
@@ -254,5 +266,5 @@ def debug():
 
 
 if __name__ == "__main__":
-    test_extractor()
-    # debug()
+    # test_extractor()
+    debug()

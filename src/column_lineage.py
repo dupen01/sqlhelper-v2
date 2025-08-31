@@ -54,7 +54,7 @@ class ColumnLineageExtractor:
             return
 
         # 根据节点类型处理
-        if isinstance(node, exp.Insert):
+        if isinstance(node, (exp.Insert, exp.Create)):
             self._handle_insert_node(node)
         elif isinstance(node, exp.Select):
             self._handle_select_node(node)
@@ -69,13 +69,13 @@ class ColumnLineageExtractor:
         self._traverse_children(node)
         self.visited.add(node)
 
-    def _handle_insert_node(self, node: exp.Insert):
+    def _handle_insert_node(self, node: exp.Insert | exp.Create):
         """处理 INSERT 节点"""
         if isinstance(node.this, exp.Table):
-            self.target_table = node.this.name
+            self.target_table = self._get_full_table_name(node.this)
         elif isinstance(node.this, exp.Schema):
             schema = node.this
-            self.target_table = schema.this.name
+            self.target_table = self._get_full_table_name(schema.this)
             self.target_columns = [col.this for col in schema.expressions]
 
     def _handle_select_node(self, node: exp.Select):
@@ -123,6 +123,7 @@ class ColumnLineageExtractor:
             self._handle_star_expression(table_map, output)
         else:
             select_node = select_expr.this
+            select_node.pop_comments()
             select_sql = select_node.sql()
 
             if isinstance(select_node, exp.Func):
@@ -193,16 +194,21 @@ class ColumnLineageExtractor:
         """获取当前作用域"""
         return self.scope_stack[-1] if self.scope_stack else "main"
 
+    def _get_full_table_name(self, table_node: exp.Table):
+        table_name = table_node.name
+        if table_node.db:
+            table_name = f"{table_node.db}.{table_name}"
+        if table_node.catalog:
+            table_name = f"{table_node.catalog}.{table_name}"
+
+        return table_name
+
     def _register_table(self, table, table_map: dict):
         """注册表到表映射中"""
         if isinstance(table, exp.Table):
-            table_name = table.name
+            table_name = self._get_full_table_name(table)
             alias = table.alias or table_name
 
-            if table.db:
-                table_name = f"{table.db}.{table.name}"
-            if table.catalog:
-                table_name = f"{table.catalog}.{table_name}"
             table_map[alias] = table_name
 
     def _find_real_column(self, items: list[dict], parent_id):
@@ -250,19 +256,22 @@ class ColumnLineageExtractor:
 
         self.column_lineage = new_column_lineage
 
-    def _process_original_columns(self, original_columns):
-        """处理原始列信息，提取输入表"""
-        processed_columns = []
-
+    def _process_original_columns(self, original_columns: list[tuple[str, str]]):
+        """
+        处理原始列信息
+        提取输入表
+        """
         for col, _type in original_columns:
             if _type in ["column", "star"]:
                 table_name = ".".join(col.split(".")[:-1])
                 self._add_input_table(table_name)
-            # function和literal类型不需要添加到输入表中
 
-            processed_columns.append(col)
+        has_column = any(item[1] == "column" for item in original_columns)
 
-        return processed_columns
+        if has_column:
+            return [item[0] for item in original_columns if item[1] == "column"]
+        else:
+            return [item[0] for item in original_columns]
 
     def _add_input_table(self, table_name):
         """添加输入表到列表中（避免重复）"""
@@ -276,52 +285,258 @@ class ColumnLineageExtractor:
         except IndexError:
             return default_column
 
+    def _process_lineage_data(self, lineage_data):
+        """
+        处理血缘数据，提取公共部分供显示方法使用
+        """
+        from collections import defaultdict
+
+        # 检查输入数据
+        if not lineage_data:
+            return None, {}
+
+        # 获取输出表名
+        output_table = lineage_data.get("output_tables", "unknown")
+        if isinstance(output_table, list) and output_table:
+            output_table = output_table[0]
+        elif not isinstance(output_table, str):
+            output_table = str(output_table) if output_table else "unknown"
+
+        # 使用字典按目标字段分组
+        lineage_dict = defaultdict(lambda: {"source_tables": set(), "source_fields": []})
+
+        # 安全获取column_lineage
+        column_lineage = lineage_data.get("column_lineage", [])
+
+        for column_info in column_lineage:
+            if not isinstance(column_info, dict):
+                continue
+
+            target_column = column_info.get("column", "unknown")
+            if not target_column:
+                continue
+
+            original_columns = column_info.get("original_columns", [])
+            for orig_item in original_columns:
+                try:
+                    # 处理原始字段，确保正确解包
+                    if isinstance(orig_item, tuple) and len(orig_item) >= 2:
+                        orig_col, _type = orig_item[0], orig_item[1]
+                    elif isinstance(orig_item, str):
+                        orig_col = orig_item
+                    else:
+                        orig_col = str(orig_item) if orig_item else ""
+
+                    # 解析原始字段的表和列名
+                    if orig_col and "." in orig_col:
+                        parts = orig_col.rsplit(".", 1)
+                        if len(parts) == 2:
+                            source_table, source_column = parts
+                            lineage_dict[target_column]["source_tables"].add(source_table)
+                    lineage_dict[target_column]["source_fields"].append(orig_col if orig_col else "")
+                except Exception:
+                    continue
+
+        # 处理字段显示格式
+        processed_lineage = {}
+        for target_column, sources in lineage_dict.items():
+            try:
+                source_tables_str = ", ".join(sorted(sources["source_tables"])) if sources["source_tables"] else ""
+
+                # 如果只有一个来源表，则只显示字段名，否则显示完整格式
+                if len(sources["source_tables"]) == 1 and sources["source_tables"]:
+                    # 只有一个来源表时，仅显示字段名部分
+                    source_fields = []
+                    for field in sources["source_fields"]:
+                        if field and "." in field:
+                            source_fields.append(field.split(".")[-1])  # 只取字段名部分
+                        elif field:
+                            source_fields.append(field)
+                    source_fields_str = ", ".join(source_fields) if source_fields else ""
+                else:
+                    # 多个来源表时，显示完整格式
+                    source_fields_str = ", ".join(sources["source_fields"]) if sources["source_fields"] else ""
+
+                processed_lineage[target_column] = {
+                    "source_tables_str": source_tables_str,
+                    "source_fields_str": source_fields_str,
+                }
+            except Exception:
+                continue
+
+        return output_table, processed_lineage
+
+    def display_compact_rich_table(self, lineage_data):
+        try:
+            from rich.console import Console
+            from rich.table import Table
+        except ImportError:
+            print("错误: 未安装 rich 库，请运行 'pip install rich' 安装")
+            return
+
+        try:
+            # 处理血缘数据
+            output_table, processed_lineage = self._process_lineage_data(lineage_data)
+
+            if output_table is None or not processed_lineage:
+                print("警告: 未提供有效的血缘数据")
+                return
+
+            console = Console()
+
+            # 创建表格
+            table = Table(show_header=True, header_style="bold bright_green", show_lines=True)
+            table.add_column("目标表", style="")
+            table.add_column("目标字段", style="")
+            table.add_column("来源表", style="")
+            table.add_column("来源字段", style="")
+
+            # 添加行
+            for target_column, data in processed_lineage.items():
+                table.add_row(
+                    str(output_table) if output_table else "unknown",
+                    str(target_column) if target_column else "unknown",
+                    data["source_tables_str"],
+                    data["source_fields_str"],
+                )
+
+            # 打印表格
+            console.print(table)
+
+        except Exception as e:
+            print(f"显示血缘关系表时出错: {e}")
+
+    def display_compact_html_table(self, lineage_data):
+        try:
+            import os
+            import webbrowser
+        except ImportError as e:
+            print(f"错误: 缺少必要的库 {e}")
+            return
+
+        try:
+            # 处理血缘数据
+            output_table, processed_lineage = self._process_lineage_data(lineage_data)
+
+            if output_table is None or not processed_lineage:
+                print("警告: 未提供有效的血缘数据")
+                return
+
+            # 创建HTML表格
+            html = """<!DOCTYPE html>
+            <html lang="zh-CN">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-size: 14px;
+            line-height: 1.6;
+            color: #333;
+        }
+
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-size: 14px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+
+        th, td {
+            border: 1px solid #ddd;
+            padding: 12px 15px;
+            text-align: left;
+        }
+
+        th {
+            background-color: #f8f9fa;
+            font-weight: 600;
+            color: #212529;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-size: 13px;
+        }
+
+        td {
+            color: #495057;
+        }
+
+        tr:nth-child(even) {
+            background-color: #f8f9fa;
+        }
+
+        tr:hover {
+            background-color: #e9ecef;
+        }
+
+        h2 {
+            font-weight: 500;
+            color: #212529;
+            margin-bottom: 20px;
+        }
+        </style>
+            </head>
+            <body>
+                <h2 style="text-align: center;">字段级血缘关系</h2>
+                <table>
+                    <tr>
+                        <th>目标表</th>
+                        <th>目标字段</th>
+                        <th>来源表</th>
+                        <th>来源字段</th>
+                    </tr>
+            """
+
+            # 添加行
+            for target_column, data in processed_lineage.items():
+                html += f"""
+                <tr>
+                    <td>{output_table}</td>
+                    <td>{target_column}</td>
+                    <td>{data["source_tables_str"]}</td>
+                    <td>{data["source_fields_str"]}</td>
+                </tr>
+                """
+
+            # 结束HTML
+            html += """
+                </table>
+            </body>
+            </html>
+            """
+
+            # 保存到文件
+            with open("compact_lineage_table.html", "w", encoding="utf-8") as f:
+                f.write(html)
+
+            abs_path = os.path.abspath("compact_lineage_table.html")
+            webbrowser.open(f"file://{abs_path}")
+            print(f"HTML文件已生成并打开: {abs_path}")
+
+        except Exception as e:
+            print(f"生成HTML血缘关系表时出错: {e}")
+
 
 # 测试代码
 sql = """
-insert into tbl_a
-(aid, aname, bid, bname, b100, etl_time)
-with cte_a as (
-select 
- a1 as id , 
- a2 as name 
-from tbl_b
-)
-, cte_b as (
-select 
- b1 as id , 
- `b2`*100 as  b100
-from tbl_c
-)
-select
- a.id, 
- if( a.name is null, b.name, c.id),
- b.id as b_id,
- b.name as b_name,
- c.b100 as new_b100, 
- current_date() -- current_date() 
-from cte_a as b
-join (
- select 
-   ifnull(t1.id, a.id) as id , 
-   a.name 
- from tbl_c t1
- join aaa a on 1=1
-) a
-on a.id = b.id
-left join cte_b as c on a.id = c.id
-;
+
 """
 
 
 def test_extractor():
-    extractor = ColumnLineageExtractor(sql, dialect="mysql")
+    extractor = ColumnLineageExtractor(sql, dialect="hive")
     lineage = extractor.extract()
 
-    for i, x in enumerate(extractor.column_lineage):
-        print(i, x)
+    # for i, x in enumerate(extractor.column_lineage):
+    #     print(i, x)
 
     print(lineage)
+
+    extractor.display_compact_rich_table(lineage)
+
+    extractor.display_compact_html_table(lineage)
 
 
 if __name__ == "__main__":
