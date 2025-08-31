@@ -226,21 +226,25 @@ class ColumnLineageExtractor:
 
 
 sql = """
-create table if not exists tmp_hive.dwd_p7_new_tmp_1 
-(
-extracted_code,
-extracted_date,
-shop_code,
-shop_name
-)
-as 
- SELECT a.extracted_code  -- `提取单号`
-    ,a.extracted_date  -- `提取日期`
-    ,a.member_id
-    ,IFNULL(IFNULL(c.deal_shop_code,a.financial_shop_code),a.extracted_shop_code) shop_code -- as '归属门店编码'
-    ,IFNULL(IFNULL(c.deal_shop_name,a.financial_shop_name),a.extracted_shop_name) shop_name -- as '归属门店名称'
- FROM ttt a
-
+select 
+id,
+name
+from t1
+union all
+select 
+id2,
+name2
+from t2
+union all
+select 
+id3,
+name3
+from t3
+union
+select 
+id4,
+name4
+from t4
 """
 
 
