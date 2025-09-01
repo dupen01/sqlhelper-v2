@@ -1,9 +1,22 @@
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 import sqlglot
 from sqlglot import expressions as exp
 from sqlglot.optimizer.qualify import qualify
+
+
+@dataclass
+class UnionContext:
+    """
+    UnionContext 用于记录并管理 SQL 中 UNION 的上下文信息。
+    """
+
+    in_union = False
+    is_union_main_query = False
+    union_main_alias = []
+    output_cols_length = 0
 
 
 class ColumnLineageExtractor:
@@ -22,10 +35,10 @@ class ColumnLineageExtractor:
 
         self.column_mapping = []
         self.column_lineage = []
-        self.input_tables = []
 
         # union 上下文
-        self.union_context = defaultdict(dict)
+        self.union_context = defaultdict(UnionContext)
+
 
     def extract(self):
         """
@@ -35,6 +48,8 @@ class ColumnLineageExtractor:
             self.ast = sqlglot.parse_one(self.sql, read=self.dialect)
             # 执行表别名限定（自动添加缺失的表别名）
             self.ast = qualify(self.ast)
+            print(f"优化后的SQL: {self.ast}")
+
             # 提取血缘关系
             self._traverse_ast(self.ast)
 
@@ -42,8 +57,6 @@ class ColumnLineageExtractor:
             self._finalize_lineage()
 
             return {
-                "input_tables": list(set(self.input_tables)),
-                "output_tables": self.target_table,
                 "column_lineage": self.column_lineage,
             }
 
@@ -93,26 +106,25 @@ class ColumnLineageExtractor:
             self._register_table(join.this, table_map)
 
         # 处理 union 查询
-        union_ctx = self.union_context[self.current_scope]
+        self.union_context[self.current_scope].in_union = False
+        self.union_context[self.current_scope].is_union_main_query = False
+
         if isinstance(node.parent, exp.Union):
-            union_ctx["in_union"] = True
+            self.union_context[self.current_scope].in_union = True
             if node.arg_key == "this":
-                union_ctx["is_union_main_query"] = True
-                union_ctx["union_main_alias"] = []
-            else:
-                union_ctx["is_union_main_query"] = False
-        else:
-            union_ctx["in_union"] = False
+                self.union_context[self.current_scope].is_union_main_query = True
+            if self.target_columns:
+                self.union_context["main"].output_cols_length = len(self.target_columns)
 
         # 处理每一个字段
         for i, select_expr in enumerate(node.selects):
             alias = select_expr.alias_or_name
 
-            if union_ctx["is_union_main_query"]:
-                union_ctx["union_main_alias"].append(alias)
+            if self.union_context[self.current_scope].is_union_main_query:
+                self.union_context[self.current_scope].union_main_alias.append(alias)
 
-            if union_ctx["in_union"] and not union_ctx["is_union_main_query"]:
-                alias = union_ctx["union_main_alias"][i]
+            if self.union_context[self.current_scope].in_union and not self.union_context[self.current_scope].is_union_main_query:
+                alias = self.union_context[self.current_scope].union_main_alias[i]
 
             output = f"{self.current_scope}.{alias}"
 
@@ -124,23 +136,25 @@ class ColumnLineageExtractor:
 
     def _handle_column_expressions(self, columns, table_map, output):
         """处理列表达式"""
+        _type = "column"
         for column in columns:
             real_table = table_map.get(column.table, column.table)
             input = f"{real_table}.{column.name}"
 
-            if isinstance(column.this, exp.Star):
-                output = f"{self.current_scope}.*"
-                _type = "star"
-            else:
-                _type = "column"
+            # if isinstance(column.this, exp.Star):
+            # if column.is_star:
+            #     output = f"{self.current_scope}.*"
+            #     _type = "star"
+            # else:
+            #     _type = "column"
 
             self.column_mapping.append({"input": input, "output": output, "type": _type})
 
     def _handle_non_column_expressions(self, select_expr, table_map, output):
-        """处理非列表达式（如函数、字面量等）"""
+        """处理非字段表达式（如函数、字面量等）"""
         # 处理 select *
-        if isinstance(select_expr, exp.Star):
-            self._handle_star_expression(table_map, output)
+        if select_expr.is_star:
+            self._handle_star_expression(table_map)
         else:
             select_node = select_expr.this
             select_node.pop_comments()
@@ -155,13 +169,20 @@ class ColumnLineageExtractor:
 
             self.column_mapping.append({"input": select_sql, "output": output, "type": _type})
 
-    def _handle_star_expression(self, table_map, output):
+    def _handle_star_expression(self, table_map):
         """处理星号表达式"""
         _type = "star"
         output = f"{self.current_scope}.*"
+
+        # if self.union_context[self.current_scope]['in_union'] and not self.union_context[self.current_scope]['is_union_main_query']:
+        #     for col in self.union_context[self.current_scope]['union_main_alias']:
+        #         item = {"input": 'unkown', "output": col, "type": _type}
+        #         self.column_mapping.append(item)
+
         for table in table_map.values():
-            select_sql = f"{table}.*"
-            self.column_mapping.append({"input": select_sql, "output": output, "type": _type})
+            input = f"{table}.*"
+            # print("_handle_star_expression: ", {"input": input, "output": output, "type": _type})
+            self.column_mapping.append({"input": input, "output": output, "type": _type})
 
     def _handle_with_node(self, node: exp.With):
         """处理 WITH 子句（CTE）"""
@@ -260,26 +281,26 @@ class ColumnLineageExtractor:
     def _finalize_lineage(self):
         """最终处理字段血缘关系"""
         new_column_lineage = []
-        self.input_tables = []
+        # try:
+        #     # if self.union_context["main"]["union_main_alias"] and not self.target_columns:
+        #     if self.union_context["main"].union_main_alias and not self.target_columns:
+        #         self.target_columns = self.union_context["main"].union_main_alias
+        # except KeyError:
+        #     pass
 
         for i, item in enumerate(self.column_lineage):
             new_original_columns = self._process_original_columns(item["original_columns"])
             new_output_column = self._get_output_column(i, item["column"])
-
-            new_item = {"column": new_output_column, "original_columns": new_original_columns}
-            new_column_lineage.append(new_item)
+            if new_output_column:
+                new_item = {"column": new_output_column, "original_columns": new_original_columns}
+                new_column_lineage.append(new_item)
 
         self.column_lineage = new_column_lineage
 
     def _process_original_columns(self, original_columns: list[tuple[str, str]]):
         """
         处理原始列信息
-        提取输入表
         """
-        for col, _type in original_columns:
-            if _type in ["column", "star"]:
-                table_name = ".".join(col.split(".")[:-1])
-                self._add_input_table(table_name)
 
         has_column = any(item[1] == "column" for item in original_columns)
 
@@ -288,23 +309,21 @@ class ColumnLineageExtractor:
         else:
             return [item[0] for item in original_columns]
 
-    def _add_input_table(self, table_name):
-        """添加输入表到列表中（避免重复）"""
-        if table_name and table_name != "unknown" and table_name not in self.input_tables:
-            self.input_tables.append(table_name)
-
     def _get_output_column(self, index, default_column):
         """获取输出列名"""
+
         try:
-            return self.target_columns[index]
+            if self.target_columns:
+                return self.target_columns[index]
+            else:
+                return default_column
         except IndexError:
-            return default_column
+            return None
 
     def _process_lineage_data(self, lineage_data):
         """
         处理血缘数据，提取公共部分供显示方法使用
         """
-        from collections import defaultdict
 
         # 检查输入数据
         if not lineage_data:
@@ -532,29 +551,3 @@ class ColumnLineageExtractor:
 
         except Exception as e:
             print(f"生成HTML血缘关系表时出错: {e}")
-
-
-# 测试代码
-sql = """
-
-"""
-
-
-def test_extractor():
-    extractor = ColumnLineageExtractor(sql, dialect="starrocks")
-    lineage = extractor.extract()
-
-    print("column_mapping: ", extractor.column_mapping)
-
-    for i, x in enumerate(extractor.column_lineage):
-        print(i, x)
-
-    print(lineage)
-
-    extractor.display_compact_rich_table(lineage)
-
-    extractor.display_compact_html_table(lineage)
-
-
-if __name__ == "__main__":
-    test_extractor()
