@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import sqlglot
 from sqlglot import expressions as exp
+from sqlglot.errors import ParseError
 from sqlglot.optimizer.qualify import qualify
 
 
@@ -17,6 +18,7 @@ class UnionContext:
     is_union_main_query = False
     union_main_alias = []
     output_cols_length = 0
+    second_query_col_cnt = 0
 
 
 class ColumnLineageExtractor:
@@ -39,7 +41,6 @@ class ColumnLineageExtractor:
         # union 上下文
         self.union_context = defaultdict(UnionContext)
 
-
     def extract(self):
         """
         主入口：解析 SQL 并提取字段血缘
@@ -48,7 +49,6 @@ class ColumnLineageExtractor:
             self.ast = sqlglot.parse_one(self.sql, read=self.dialect)
             # 执行表别名限定（自动添加缺失的表别名）
             self.ast = qualify(self.ast)
-            print(f"优化后的SQL: {self.ast}")
 
             # 提取血缘关系
             self._traverse_ast(self.ast)
@@ -72,12 +72,15 @@ class ColumnLineageExtractor:
         # 根据节点类型处理
         if isinstance(node, (exp.Insert, exp.Create)):
             self._handle_insert_node(node)
-        elif isinstance(node, exp.Select):
-            self._handle_select_node(node)
+
         elif isinstance(node, exp.With):
             self._handle_with_node(node)
         elif isinstance(node, exp.Subquery):
             self._handle_subquery_node(node)
+        elif isinstance(node, exp.Union):
+            self._handle_union_node(node)
+        elif isinstance(node, exp.Select):
+            self._handle_select_node(node)
 
         # 递归处理子节点
         self._traverse_children(node)
@@ -116,6 +119,9 @@ class ColumnLineageExtractor:
             if self.target_columns:
                 self.union_context["main"].output_cols_length = len(self.target_columns)
 
+        if node.parent and isinstance(node.parent.parent, exp.Union):
+            self.union_context[self.current_scope].in_union = True
+
         # 处理每一个字段
         for i, select_expr in enumerate(node.selects):
             alias = select_expr.alias_or_name
@@ -123,7 +129,10 @@ class ColumnLineageExtractor:
             if self.union_context[self.current_scope].is_union_main_query:
                 self.union_context[self.current_scope].union_main_alias.append(alias)
 
-            if self.union_context[self.current_scope].in_union and not self.union_context[self.current_scope].is_union_main_query:
+            if (
+                self.union_context[self.current_scope].in_union
+                and not self.union_context[self.current_scope].is_union_main_query
+            ):
                 alias = self.union_context[self.current_scope].union_main_alias[i]
 
             output = f"{self.current_scope}.{alias}"
@@ -140,13 +149,6 @@ class ColumnLineageExtractor:
         for column in columns:
             real_table = table_map.get(column.table, column.table)
             input = f"{real_table}.{column.name}"
-
-            # if isinstance(column.this, exp.Star):
-            # if column.is_star:
-            #     output = f"{self.current_scope}.*"
-            #     _type = "star"
-            # else:
-            #     _type = "column"
 
             self.column_mapping.append({"input": input, "output": output, "type": _type})
 
@@ -171,18 +173,13 @@ class ColumnLineageExtractor:
 
     def _handle_star_expression(self, table_map):
         """处理星号表达式"""
-        _type = "star"
-        output = f"{self.current_scope}.*"
+        raise NotImplementedError("暂不支持 * 语法")
+        # _type = "star"
+        # output = f"{self.current_scope}.*"
 
-        # if self.union_context[self.current_scope]['in_union'] and not self.union_context[self.current_scope]['is_union_main_query']:
-        #     for col in self.union_context[self.current_scope]['union_main_alias']:
-        #         item = {"input": 'unkown', "output": col, "type": _type}
-        #         self.column_mapping.append(item)
-
-        for table in table_map.values():
-            input = f"{table}.*"
-            # print("_handle_star_expression: ", {"input": input, "output": output, "type": _type})
-            self.column_mapping.append({"input": input, "output": output, "type": _type})
+        # for table in table_map.values():
+        #     input = f"{table}.*"
+        #     self.column_mapping.append({"input": input, "output": output, "type": _type})
 
     def _handle_with_node(self, node: exp.With):
         """处理 WITH 子句（CTE）"""
@@ -194,8 +191,61 @@ class ColumnLineageExtractor:
     def _handle_subquery_node(self, node: exp.Subquery):
         """处理子查询"""
         subquery_alias = node.alias
-        with self._scope_context(subquery_alias):
+        # 处理子查询没有别名的情况
+        if not subquery_alias:
             self._traverse_ast(node.this)
+        else:
+            with self._scope_context(subquery_alias):
+                self._traverse_ast(node.this)
+
+    def _handle_union_node(self, node: exp.Union):
+        """
+        处理 UNION 节点
+        校验每个查询的列数是否一致
+        """
+        first_query = node.this
+        second_query = node.expression
+
+        if isinstance(second_query, exp.Select):
+            print('second_query: ', second_query.sql())
+            second_query_col_cnt = self._get_select_exp_cols_length(second_query)
+        elif isinstance(second_query, exp.Subquery):
+            second_query_col_cnt = self._get_select_exp_cols_length(second_query.this)
+
+        cxt_second_query_col_cnt = self.union_context[self.current_scope].second_query_col_cnt
+        print("second_query_col_cnt:", cxt_second_query_col_cnt)
+
+        if cxt_second_query_col_cnt == 0:
+            self.union_context[self.current_scope].second_query_col_cnt = second_query_col_cnt
+            cxt_second_query_col_cnt = self.union_context[self.current_scope].second_query_col_cnt
+        else:
+            if (
+                second_query_col_cnt != -1
+                and cxt_second_query_col_cnt != -1
+                and cxt_second_query_col_cnt != second_query_col_cnt
+            ):
+                raise ParseError(
+                    f"The number of columns in the first query ({cxt_second_query_col_cnt}) does not match the number of columns in the second query ({second_query_col_cnt})"
+                )
+            else:
+                pass
+
+        if isinstance(first_query, exp.Select):
+            first_query_col_cnt = self._get_select_exp_cols_length(first_query)
+            print("first_query_col_cnt:", first_query_col_cnt)
+            print("second_query_col_cnt:", cxt_second_query_col_cnt)
+            if first_query_col_cnt != cxt_second_query_col_cnt and cxt_second_query_col_cnt != -1:
+                raise ParseError(
+                    f"The number of columns in the first query ({first_query_col_cnt}) does not match the number of columns in the second query ({cxt_second_query_col_cnt})"
+                )
+
+        pass
+
+    def _get_select_exp_cols_length(self, node: exp.Select):
+        """获取 select 节点的列数"""
+        if any(col_exp.is_star for col_exp in node.expressions):
+            return -1
+        return len(node.expressions)
 
     def _traverse_children(self, node: exp.Expression):
         """遍历节点的子节点"""
@@ -266,7 +316,7 @@ class ColumnLineageExtractor:
 
     def _resolve_column_lineage(self):
         """解析字段血缘关系"""
-        self.column_lineage = []
+        # self.column_lineage = []
         for item in self.column_mapping:
             output_scope = item["output"].split(".")[0]
             if output_scope == "main":
