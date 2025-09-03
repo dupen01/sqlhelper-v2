@@ -1,6 +1,6 @@
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import sqlglot
 from sqlglot import expressions as exp
@@ -16,9 +16,15 @@ class UnionContext:
 
     in_union = False
     is_union_main_query = False
-    union_main_alias = []
+    union_main_alias: list = field(default_factory=list)
     output_cols_length = 0
     second_query_col_cnt = 0
+
+
+@dataclass
+class _LineageDict:
+    source_tables: set = field(default_factory=set)
+    source_fields: list = field(default_factory=list)
 
 
 class ColumnLineageExtractor:
@@ -206,46 +212,40 @@ class ColumnLineageExtractor:
         first_query = node.this
         second_query = node.expression
 
+        # 获取第二个查询的列数
         if isinstance(second_query, exp.Select):
-            print('second_query: ', second_query.sql())
             second_query_col_cnt = self._get_select_exp_cols_length(second_query)
         elif isinstance(second_query, exp.Subquery):
             second_query_col_cnt = self._get_select_exp_cols_length(second_query.this)
+        else:
+            second_query_col_cnt = -1
 
+        # 检查并设置第二个查询的列数
         cxt_second_query_col_cnt = self.union_context[self.current_scope].second_query_col_cnt
-        print("second_query_col_cnt:", cxt_second_query_col_cnt)
 
         if cxt_second_query_col_cnt == 0:
             self.union_context[self.current_scope].second_query_col_cnt = second_query_col_cnt
-            cxt_second_query_col_cnt = self.union_context[self.current_scope].second_query_col_cnt
-        else:
-            if (
-                second_query_col_cnt != -1
-                and cxt_second_query_col_cnt != -1
-                and cxt_second_query_col_cnt != second_query_col_cnt
-            ):
-                raise ParseError(
-                    f"The number of columns in the first query ({cxt_second_query_col_cnt}) does not match the number of columns in the second query ({second_query_col_cnt})"
-                )
-            else:
-                pass
+            cxt_second_query_col_cnt = second_query_col_cnt
 
+        # 验证列数匹配
+        if second_query_col_cnt != -1 and cxt_second_query_col_cnt != -1 and cxt_second_query_col_cnt != second_query_col_cnt:
+            raise ParseError(
+                f"The number of columns in the first query ({cxt_second_query_col_cnt}) "
+                f"does not match the number of columns in the second query ({second_query_col_cnt})"
+            )
+
+        # 验证第一个查询的列数
         if isinstance(first_query, exp.Select):
             first_query_col_cnt = self._get_select_exp_cols_length(first_query)
-            print("first_query_col_cnt:", first_query_col_cnt)
-            print("second_query_col_cnt:", cxt_second_query_col_cnt)
             if first_query_col_cnt != cxt_second_query_col_cnt and cxt_second_query_col_cnt != -1:
                 raise ParseError(
-                    f"The number of columns in the first query ({first_query_col_cnt}) does not match the number of columns in the second query ({cxt_second_query_col_cnt})"
+                    f"The number of columns in the first query ({first_query_col_cnt}) "
+                    f"does not match the number of columns in the second query ({cxt_second_query_col_cnt})"
                 )
-
-        pass
 
     def _get_select_exp_cols_length(self, node: exp.Select):
         """获取 select 节点的列数"""
-        if any(col_exp.is_star for col_exp in node.expressions):
-            return -1
-        return len(node.expressions)
+        return -1 if any(col_exp.is_star for col_exp in node.expressions) else len(node.expressions)
 
     def _traverse_children(self, node: exp.Expression):
         """遍历节点的子节点"""
@@ -331,12 +331,6 @@ class ColumnLineageExtractor:
     def _finalize_lineage(self):
         """最终处理字段血缘关系"""
         new_column_lineage = []
-        # try:
-        #     # if self.union_context["main"]["union_main_alias"] and not self.target_columns:
-        #     if self.union_context["main"].union_main_alias and not self.target_columns:
-        #         self.target_columns = self.union_context["main"].union_main_alias
-        # except KeyError:
-        #     pass
 
         for i, item in enumerate(self.column_lineage):
             new_original_columns = self._process_original_columns(item["original_columns"])
@@ -351,22 +345,14 @@ class ColumnLineageExtractor:
         """
         处理原始列信息
         """
-
-        has_column = any(item[1] == "column" for item in original_columns)
-
-        if has_column:
-            return [item[0] for item in original_columns if item[1] == "column"]
-        else:
-            return [item[0] for item in original_columns]
+        column_items = [item[0] for item in original_columns if item[1] == "column"]
+        return column_items if column_items else [item[0] for item in original_columns]
 
     def _get_output_column(self, index, default_column):
         """获取输出列名"""
 
         try:
-            if self.target_columns:
-                return self.target_columns[index]
-            else:
-                return default_column
+            return self.target_columns[index] if self.target_columns else default_column
         except IndexError:
             return None
 
@@ -380,14 +366,15 @@ class ColumnLineageExtractor:
             return None, {}
 
         # 获取输出表名
-        output_table = lineage_data.get("output_tables", "unknown")
+        output_table = self.target_table
         if isinstance(output_table, list) and output_table:
             output_table = output_table[0]
         elif not isinstance(output_table, str):
             output_table = str(output_table) if output_table else "unknown"
 
         # 使用字典按目标字段分组
-        lineage_dict = defaultdict(lambda: {"source_tables": set(), "source_fields": []})
+        # lineage_dict = defaultdict(lambda: {"source_tables": set(), "source_fields": []})
+        lineage_dict = defaultdict(_LineageDict)
 
         # 安全获取column_lineage
         column_lineage = lineage_data.get("column_lineage", [])
@@ -415,9 +402,10 @@ class ColumnLineageExtractor:
                     if orig_col and "." in orig_col:
                         parts = orig_col.rsplit(".", 1)
                         if len(parts) == 2:
-                            source_table, source_column = parts
-                            lineage_dict[target_column]["source_tables"].add(source_table)
-                    lineage_dict[target_column]["source_fields"].append(orig_col if orig_col else "")
+                            source_table, _ = parts
+                            lineage_dict[target_column].source_tables.add(source_table)
+                    lineage_dict[target_column].source_fields.append(orig_col if orig_col else "")
+
                 except Exception:
                     continue
 
@@ -425,13 +413,13 @@ class ColumnLineageExtractor:
         processed_lineage = {}
         for target_column, sources in lineage_dict.items():
             try:
-                source_tables_str = ", ".join(sorted(sources["source_tables"])) if sources["source_tables"] else ""
+                source_tables_str = ", ".join(sorted(sources.source_tables)) if sources.source_tables else ""
 
                 # 如果只有一个来源表，则只显示字段名，否则显示完整格式
-                if len(sources["source_tables"]) == 1 and sources["source_tables"]:
+                if len(sources.source_tables) == 1 and sources.source_tables:
                     # 只有一个来源表时，仅显示字段名部分
                     source_fields = []
-                    for field in sources["source_fields"]:
+                    for field in sources.source_fields:
                         if field and "." in field:
                             source_fields.append(field.split(".")[-1])  # 只取字段名部分
                         elif field:
@@ -439,7 +427,7 @@ class ColumnLineageExtractor:
                     source_fields_str = ", ".join(source_fields) if source_fields else ""
                 else:
                     # 多个来源表时，显示完整格式
-                    source_fields_str = ", ".join(sources["source_fields"]) if sources["source_fields"] else ""
+                    source_fields_str = ", ".join(sources.source_fields) if sources.source_fields else ""
 
                 processed_lineage[target_column] = {
                     "source_tables_str": source_tables_str,
